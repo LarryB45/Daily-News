@@ -1,0 +1,20 @@
+name: Daily News to Discord
+
+on:
+  schedule:
+    - cron: "0 7 * * *"   # 07:00 UTC every day (i.e., 07:00 GMT)
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Send briefing to Discord
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python news_to_discord.py
