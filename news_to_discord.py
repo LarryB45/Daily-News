@@ -1,5 +1,5 @@
 # news_to_discord.py
-import os, time, html, re
+import os, time, html, re, sys
 import requests, feedparser
 from bs4 import BeautifulSoup
 from dateutil import parser as dtparser
@@ -11,8 +11,9 @@ DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 TARGET_CATEGORIES = ["Markets", "UK News", "Global Politics", "VC/PE", "Insurance"]
 FALLBACK_CATEGORY = "Light-hearted"
 HEADLINES_PER_CATEGORY = 3
-LOOKBACK_HOURS = 36  # prefer items within last 36h
-MAX_SUMMARY_CHARS = 520   # keep summaries tight for Discord
+LOOKBACK_DAYS = 3
+MAX_SUMMARY_CHARS = 520
+ENABLE_ARTICLE_FETCH = False  # <- set True if you want deeper summaries (can 403/timeout on some sites)
 
 RSS_SOURCES = {
     "Markets": [
@@ -48,9 +49,49 @@ RSS_SOURCES = {
 }
 
 SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9“\"'])")
+URL_RE = re.compile(r"http[s]?://\S+")
+
+def log(*args):
+    print("[news]", *args, file=sys.stdout, flush=True)
 
 def strip_html(text: str) -> str:
     return BeautifulSoup(html.unescape(text or ""), "html.parser").get_text(" ", strip=True)
 
 def parse_time(entry):
     for key in ("published", "updated"):
+        val = entry.get(key) or entry.get(key + "_parsed")
+        if val:
+            try:
+                if isinstance(val, str):
+                    return dtparser.parse(val)
+                else:
+                    return datetime.fromtimestamp(time.mktime(val), tz=timezone.utc)
+            except Exception:
+                continue
+    return None
+
+def fetch_article_text(url: str, timeout=8) -> str:
+    if not ENABLE_ARTICLE_FETCH or not url:
+        return ""
+    try:
+        r = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0 (DailyBrief/1.0)"})
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+        for tag in soup(["script", "style", "nav", "footer", "header", "aside", "form", "noscript"]):
+            tag.decompose()
+        container = soup.find("article") or soup.body
+        ps = (container.find_all("p") if container else []) or soup.find_all("p")
+        text = " ".join(p.get_text(" ", strip=True) for p in ps)
+        text = re.sub(r"\s+", " ", text).strip()
+        text = re.sub(r"(Subscribe|Sign up|Cookies|Advertisement).*$", "", text, flags=re.IGNORECASE)
+        return text[:6000]
+    except Exception as e:
+        log("fetch_article_text error:", e)
+        return ""
+
+def summarize(text: str, max_sentences=3, max_chars=MAX_SUMMARY_CHARS) -> str:
+    clean = strip_html(text)
+    if not clean:
+        return ""
+    parts = SENTENCE_SPLIT.split(clean)
+    picked = " ".join(parts
