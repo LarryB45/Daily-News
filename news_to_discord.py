@@ -1,20 +1,19 @@
-import os, re, time, textwrap, html
+import os, time, html
 import requests, feedparser
 from bs4 import BeautifulSoup
 from dateutil import parser as dtparser
 from datetime import datetime, timedelta, timezone
+import re
 
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 
-# --- CONFIG ---
 TARGET_CATEGORIES = ["Markets", "UK News", "Global Politics", "VC/PE", "Insurance"]
 FALLBACK_CATEGORY = "Light-hearted"
-MAX_SENTENCES = 3
-LOOKBACK_HOURS = 36  # accept stories from last 36h first
+HEADLINES_PER_CATEGORY = 5
+LOOKBACK_HOURS = 36
 
 RSS_SOURCES = {
     "Markets": [
-        # Financial/global markets
         "https://www.reuters.com/finance/markets/rss",
         "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",
         "https://finance.yahoo.com/news/rssindex",
@@ -31,12 +30,12 @@ RSS_SOURCES = {
     ],
     "VC/PE": [
         "https://techcrunch.com/tag/funding/feed/",
-        "https://feeds.feedburner.com/pehubblog",   # PE Hub (public posts)
+        "https://feeds.feedburner.com/pehubblog",
         "https://news.crunchbase.com/feed/",
     ],
     "Insurance": [
         "https://www.insurancejournal.com/rss/ijnational.rss",
-        "https://www.insurancetimes.co.uk/XmlServers/navsectionrss.aspx?navsectioncode=News",  # UK
+        "https://www.insurancetimes.co.uk/XmlServers/navsectionrss.aspx?navsectioncode=News",
         "https://www.insurancebusinessmag.com/uk/rss/",
     ],
     "Light-hearted": [
@@ -46,29 +45,10 @@ RSS_SOURCES = {
     ],
 }
 
-# --- Helpers ---
-SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9“\"'])")
-
 def strip_html(text):
-    if not text:
-        return ""
-    text = html.unescape(text)
-    return BeautifulSoup(text, "html.parser").get_text(" ", strip=True)
-
-def summarize(text, max_sentences=3, max_chars=420):
-    clean = strip_html(text)
-    parts = SENTENCE_SPLIT.split(clean)
-    if not parts:
-        parts = [clean]
-    summary = " ".join(parts[:max_sentences]).strip()
-    if len(summary) > max_chars:
-        summary = summary[:max_chars].rsplit(" ", 1)[0] + "…"
-    # Ensure 1–3 short bullet-ish lines for Discord readability
-    # We'll keep as plain sentences; Discord will wrap.
-    return summary
+    return BeautifulSoup(html.unescape(text or ""), "html.parser").get_text(" ", strip=True)
 
 def parse_time(entry):
-    # Try multiple fields
     for key in ("published", "updated"):
         val = entry.get(key) or entry.get(key + "_parsed")
         if val:
@@ -76,63 +56,27 @@ def parse_time(entry):
                 if isinstance(val, str):
                     return dtparser.parse(val)
                 else:
-                    # time.struct_time
                     return datetime.fromtimestamp(time.mktime(val), tz=timezone.utc)
-            except Exception:
+            except:
                 continue
     return None
 
-def pick_fresh_item(feeds, cutoff_recent, cutoff_any):
-    best_recent, best_any = None, None
-    seen_titles = set()
+def get_headlines(feeds, cutoff_recent, cutoff_any, max_items=5):
+    headlines = []
+    seen = set()
     for url in feeds:
         fp = feedparser.parse(url)
-        for e in fp.entries[:15]:
+        for e in fp.entries[:20]:
             title = strip_html(e.get("title", "")).strip()
-            if not title or title.lower() in seen_titles:
+            if not title or title.lower() in seen:
                 continue
-            seen_titles.add(title.lower())
-            link = e.get("link") or ""
-            desc = e.get("summary") or e.get("description") or ""
-            published = parse_time(e) or datetime.now(timezone.utc)  # if unknown, treat as now
-            item = {
-                "title": title,
-                "link": link,
-                "desc": desc,
-                "published": published.astimezone(timezone.utc),
-            }
-            if item["published"] >= cutoff_recent:
-                if not best_recent or item["published"] > best_recent["published"]:
-                    best_recent = item
-            if item["published"] >= cutoff_any:
-                if not best_any or item["published"] > best_any["published"]:
-                    best_any = item
-    return best_recent or best_any
-
-def build_embeds(selected):
-    embeds = []
-    for cat, item in selected:
-        if not item:
-            continue
-        title = item["title"][:250]
-        url = item["link"] or None
-        desc = summarize(item["desc"], max_sentences=MAX_SENTENCES)
-        ts = item["published"].isoformat()
-        embeds.append({
-            "title": f"{cat}: {title}",
-            "url": url,
-            "description": desc,
-            "timestamp": ts,
-            "color": 0x2b6cb0,  # blue
-            "footer": {"text": "Daily Briefing"},
-        })
-    return embeds
-
-def post_to_discord(webhook_url, content, embeds):
-    payload = {"content": content, "embeds": embeds}
-    r = requests.post(webhook_url, json=payload, timeout=20)
-    r.raise_for_status()
-    return r.status_code
+            seen.add(title.lower())
+            pub_time = parse_time(e) or datetime.now(timezone.utc)
+            if pub_time >= cutoff_any:
+                headlines.append(title)
+            if len(headlines) >= max_items:
+                return headlines
+    return headlines
 
 def main():
     if not DISCORD_WEBHOOK_URL:
@@ -140,33 +84,29 @@ def main():
 
     now = datetime.now(timezone.utc)
     cutoff_recent = now - timedelta(hours=LOOKBACK_HOURS)
-    cutoff_any = now - timedelta(days=3)  # relaxed if quiet
+    cutoff_any = now - timedelta(days=3)
 
-    selected = []
-
-    # Guarantee five slots; if a category has nothing, we'll try the fallback later.
+    sections = {}
     for cat in TARGET_CATEGORIES:
-        item = pick_fresh_item(RSS_SOURCES[cat], cutoff_recent, cutoff_any)
-        selected.append((cat, item))
+        headlines = get_headlines(RSS_SOURCES[cat], cutoff_recent, cutoff_any, HEADLINES_PER_CATEGORY)
+        if not headlines:
+            headlines = get_headlines(RSS_SOURCES[FALLBACK_CATEGORY], cutoff_recent, cutoff_any, HEADLINES_PER_CATEGORY)
+        sections[cat] = headlines
 
-    # Fill gaps with Light-hearted
-    for i, (cat, item) in enumerate(selected):
-        if item is None:
-            lh_item = pick_fresh_item(RSS_SOURCES[FALLBACK_CATEGORY], cutoff_recent, cutoff_any)
-            selected[i] = (FALLBACK_CATEGORY, lh_item if lh_item else None)
+    # Build message
+    date_str = now.strftime("%Y-%m-%d")
+    lines = [f"**Daily News Briefing — {date_str} — 07:00 GMT**\n"]
+    for cat, headlines in sections.items():
+        lines.append(f"**{cat}**")
+        for h in headlines:
+            lines.append(f"- {h}")
+        lines.append("")  # blank line after each category
 
-    # Keep only items that exist, and trim to 5
-    selected = [(c, i) for c, i in selected if i][:5]
+    content = "\n".join(lines)
 
-    if not selected:
-        # As a failsafe, push a simple ping so you notice something is off
-        post_to_discord(DISCORD_WEBHOOK_URL, "Daily Briefing: no stories found today.", [])
-        return
-
-    date_str = now.astimezone(timezone.utc).strftime("%Y-%m-%d")
-    content = f"**Daily News Briefing — {date_str} — 07:00 GMT**"
-    embeds = build_embeds(selected)
-    post_to_discord(DISCORD_WEBHOOK_URL, content, embeds)
+    # Send to Discord
+    r = requests.post(DISCORD_WEBHOOK_URL, json={"content": content})
+    r.raise_for_status()
 
 if __name__ == "__main__":
     main()
